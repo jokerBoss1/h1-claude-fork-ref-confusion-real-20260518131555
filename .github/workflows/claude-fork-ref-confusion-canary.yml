@@ -1,0 +1,76 @@
+name: Claude fork PR ref-confusion canary
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  canary:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Record victim before
+        shell: bash
+        run: |
+          set -euo pipefail
+          git ls-remote origin refs/heads/victim | cut -f1 > "$RUNNER_TEMP/victim-before.txt"
+          echo "victim_before=$(cat "$RUNNER_TEMP/victim-before.txt")"
+          git remote -v
+
+      - name: Install deterministic fake Claude CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/fake-claude" <<'FAKE_CLAUDE'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cat >/dev/null || true
+          cd "$GITHUB_WORKSPACE"
+          printf 'claude branch confusion canary from deterministic fake CLI\n' > claude-output.txt
+          git add claude-output.txt
+          git commit -m 'claude: deterministic branch confusion canary'
+          "$GITHUB_ACTION_PATH/scripts/git-push.sh" origin HEAD
+          session_id="00000000-0000-4000-8000-000000000001"
+          uuid1="00000000-0000-4000-8000-000000000002"
+          uuid2="00000000-0000-4000-8000-000000000003"
+          printf '{"type":"system","subtype":"init","apiKeySource":"none","claude_code_version":"fake-h1-canary","cwd":"%s","tools":[],"mcp_servers":[],"model":"fake","permissionMode":"acceptEdits","slash_commands":[],"output_style":"default","skills":[],"plugins":[],"uuid":"%s","session_id":"%s"}\n' "$GITHUB_WORKSPACE" "$uuid1" "$session_id"
+          printf '{"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":0,"is_error":false,"num_turns":1,"result":"deterministic fake Claude completed branch confusion canary","stop_reason":"end_turn","total_cost_usd":0,"usage":{},"modelUsage":{},"permission_denials":[],"uuid":"%s","session_id":"%s"}\n' "$uuid2" "$session_id"
+          FAKE_CLAUDE
+          chmod +x "$RUNNER_TEMP/fake-claude"
+
+      - name: Run Claude Code Action with deterministic fake CLI
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: H1_FAKE_NO_REAL_API_KEY_FOR_DETERMINISTIC_CLI
+          github_token: ${{ github.token }}
+          classify_inline_comments: false
+          path_to_claude_code_executable: ${{ runner.temp }}/fake-claude
+
+      - name: Inspect base victim after
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          before="$(cat "$RUNNER_TEMP/victim-before.txt")"
+          after="$(git ls-remote origin refs/heads/victim | cut -f1)"
+          echo "victim_before=$before"
+          echo "victim_after=$after"
+          if [ "$before" != "$after" ]; then
+            echo "CONFIRMED: base repo refs/heads/victim advanced during the fork PR Claude run"
+            git fetch origin victim --depth=20
+            git log --oneline --decorate --max-count=5 origin/victim
+          else
+            echo "CONFIRMATION_FAILED: base victim branch did not advance"
+            exit 1
+          fi
